@@ -57,7 +57,8 @@
     <p class="keys">
       <b>W A S D</b> move &nbsp; <b>mouse</b> look &nbsp; (in VR: turn your head)<br>
       <b>Space</b> rise &nbsp; <b>C</b> descend &nbsp; <b>Shift</b> sprint &nbsp; <b>pinch-hold</b> glide<br>
-      <b>T/R</b> or <b>scroll</b> speed &nbsp; <b>M</b> wind &nbsp; <b>0</b> reset &nbsp; <b>Esc</b> pause
+      <b>T/R</b> or <b>scroll</b> speed &nbsp; <b>M</b> wind &nbsp; <b>0</b> reset &nbsp; <b>Esc</b> pause<br>
+      <b>gamepad</b> left stick move &nbsp; right stick rise + snap turn &nbsp; <b>R2</b> sprint &nbsp; <b>d-pad</b> speed
     </p>
   </div>
 </div>
@@ -533,6 +534,13 @@ function makeBlob(r, seed, wSeg, hSeg){
 /* ============================ sky ============================ */
 
 const uSpaceU = { value: 0 };
+/* Headsets may clamp the far plane (the WebXR spec allows a platform maximum,
+   often ~1000 m; visionOS does this). These uniforms drive a radial depth
+   compression: beyond uCompD0 meters, vertices slide toward the camera along
+   their view ray, folding the whole world into the granted depth range. The
+   image is unchanged (directions are preserved) and stereo is imperceptibly
+   flattened only where stereopsis is already gone. 0 = off (desktop). */
+const uCompOn = { value: 0 }, uCompD0 = { value: 400 }, uCompK = { value: 500 };
 const skyMat = new THREE.ShaderMaterial({
   side: THREE.BackSide, depthWrite: false, depthWrite:false, fog:false,
   uniforms:{
@@ -583,7 +591,9 @@ const skyMat = new THREE.ShaderMaterial({
       #include <colorspace_fragment>
     }`
 });
-const sky = new THREE.Mesh(new THREE.SphereGeometry(26000, 32, 16), skyMat);
+/* the dome is camera-centered and depthless, so its radius is arbitrary:
+   keep it small enough to sit inside any headset's clipped far plane */
+const sky = new THREE.Mesh(new THREE.SphereGeometry(750, 32, 16), skyMat);
 sky.renderOrder = -100;
 sky.frustumCulled = false;
 scene.add(sky);
@@ -689,13 +699,22 @@ scene.add(planet);
 // atmosphere rim: a fresnel shell that glows at the limb from orbit
 const atmoMat = new THREE.ShaderMaterial({
   transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
-  uniforms: { atmoCol: { value: lin('#7fb0e0') } },
+  uniforms: { atmoCol: { value: lin('#7fb0e0') }, uCompOn, uCompD0, uCompK },
   vertexShader:`
     varying vec3 vN; varying vec3 vW;
+    uniform float uCompOn; uniform float uCompD0; uniform float uCompK;
     void main(){
       vN = normalize(mat3(modelMatrix) * normal);
       vec4 wp = modelMatrix * vec4(position, 1.0);
       vW = wp.xyz;
+      if(uCompOn > 0.5){
+        vec3 rel = wp.xyz - cameraPosition;
+        float dTrue = length(rel);
+        if(dTrue > uCompD0){
+          float dComp = uCompD0 + uCompK*(dTrue-uCompD0)/(uCompK+(dTrue-uCompD0));
+          wp.xyz = cameraPosition + rel*(dComp/dTrue);
+        }
+      }
       gl_Position = projectionMatrix * viewMatrix * wp;
     }`,
   fragmentShader:`
@@ -1440,11 +1459,13 @@ function billboardMat(tintHex, opac){
       tint: { value: lin(tintHex) },
       opac: { value: opac },
       fogColor: { value: FOG_COLOR.clone() },
-      fogNear: { value: 13000 }, fogFar: { value: 28000 }
+      fogNear: { value: 13000 }, fogFar: { value: 28000 },
+      uCompOn, uCompD0, uCompK
     },
     vertexShader:`
     varying vec2 vUv; varying float vFog;
     uniform float fogNear; uniform float fogFar;
+    uniform float uCompOn; uniform float uCompD0; uniform float uCompK;
     void main(){
       vUv = uv;
       vec4 c = instanceMatrix * vec4(0.0, 0.0, 0.0, 1.0);
@@ -1454,9 +1475,17 @@ function billboardMat(tintHex, opac){
       float cdx = wc.x - cameraPosition.x;
       float cdz = wc.z - cameraPosition.z;
       wc.y -= (cdx*cdx + cdz*cdz) / 440000.0;
+      vec3 rel = wc.xyz - cameraPosition;
+      float dTrue = length(rel);
+      vFog = smoothstep(fogNear, fogFar, dTrue);
+      float ratio = 1.0;
+      if(uCompOn > 0.5 && dTrue > uCompD0){
+        float dComp = uCompD0 + uCompK*(dTrue-uCompD0)/(uCompK+(dTrue-uCompD0));
+        ratio = dComp/dTrue;
+        wc.xyz = cameraPosition + rel*ratio;
+      }
       vec4 mv = viewMatrix * wc;
-      mv.xy += position.xy * vec2(sx, sy);
-      vFog = smoothstep(fogNear, fogFar, -mv.z);
+      mv.xy += position.xy * vec2(sx, sy) * ratio;
       gl_Position = projectionMatrix * mv;
     }`,
     fragmentShader:`
@@ -1518,17 +1547,25 @@ scene.add(mistInst);
 const shaftMat = new THREE.ShaderMaterial({
   transparent: true, depthWrite: false, side: THREE.DoubleSide,
   blending: THREE.AdditiveBlending,
-  uniforms: { uOp: { value: 0.085 }, uCol: { value: lin('#ffdfae') } },
+  uniforms: { uOp: { value: 0.085 }, uCol: { value: lin('#ffdfae') },
+              uCompOn, uCompD0, uCompK },
   vertexShader:`
     varying vec2 vUv; varying float vDist;
+    uniform float uCompOn; uniform float uCompD0; uniform float uCompK;
     void main(){
       vUv = uv;
       vec4 wpS = modelMatrix * instanceMatrix * vec4(position, 1.0);
       float cdx = wpS.x - cameraPosition.x;
       float cdz = wpS.z - cameraPosition.z;
       wpS.y -= (cdx*cdx + cdz*cdz) / 440000.0;
+      vec3 rel = wpS.xyz - cameraPosition;
+      float dTrue = length(rel);
+      vDist = dTrue;
+      if(uCompOn > 0.5 && dTrue > uCompD0){
+        float dComp = uCompD0 + uCompK*(dTrue-uCompD0)/(uCompK+(dTrue-uCompD0));
+        wpS.xyz = cameraPosition + rel*(dComp/dTrue);
+      }
       vec4 mv = viewMatrix * wpS;
-      vDist = -mv.z;
       gl_Position = projectionMatrix * mv;
     }`,
   fragmentShader:`
@@ -1773,6 +1810,10 @@ renderer.xr.addEventListener('sessionend', ()=>{
   camera.updateProjectionMatrix();
   overlay.style.display = 'flex';
   goText.textContent = 'Paused. Click to continue';
+  if(window.__xrFar){
+    xrstat.textContent = 'Headset far plane: ' + Math.round(window.__xrFar) + ' m' +
+      (window.__xrFar < 250000 ? ' — depth compression was active.' : '');
+  }
 });
 
 /* ============================ wind audio ============================ */
@@ -1877,7 +1918,7 @@ function addGlow(x, y, z, s){
   const spr = new THREE.Sprite(glowMat);
   spr.scale.set(s, s, 1);
   spr.position.set(x, y, z);
-  glows.push({ spr, x, y, z });
+  glows.push({ spr, x, y, z, s });
   scene.add(spr);
 }
 
@@ -2025,32 +2066,92 @@ for(const [out, mat] of [[hullOut, hullMat], [spDarkOut, spDarkMat], [spGlowOut,
 /* Every terrestrial vertex drops with the square of horizontal distance, so the
    flat world conforms to the planet sphere below and the horizon truly curves. */
 
-function addCurvature(mat){
+function addCurvature(mat, curve){
   const prev = mat.onBeforeCompile;
+  const drop = curve === false ? '' : `{
+  float cdx = wpCurve.x - cameraPosition.x;
+  float cdz = wpCurve.z - cameraPosition.z;
+  wpCurve.y -= (cdx*cdx + cdz*cdz) / 440000.0;
+}`;
   mat.onBeforeCompile = (sh)=>{
     if(prev) prev(sh);
-    sh.vertexShader = sh.vertexShader.replace('#include <project_vertex>',
+    sh.uniforms.uCompOn = uCompOn;
+    sh.uniforms.uCompD0 = uCompD0;
+    sh.uniforms.uCompK = uCompK;
+    sh.vertexShader = 'uniform float uCompOn;\nuniform float uCompD0;\nuniform float uCompK;\n'
+      + sh.vertexShader.replace('#include <project_vertex>',
 `vec4 wpCurve = vec4( transformed, 1.0 );
 #ifdef USE_INSTANCING
 wpCurve = instanceMatrix * wpCurve;
 #endif
 wpCurve = modelMatrix * wpCurve;
-{
-  float cdx = wpCurve.x - cameraPosition.x;
-  float cdz = wpCurve.z - cameraPosition.z;
-  wpCurve.y -= (cdx*cdx + cdz*cdz) / 440000.0;
+${drop}
+vec4 wpOut = wpCurve;
+if(uCompOn > 0.5){
+  vec3 relC = wpCurve.xyz - cameraPosition;
+  float dTrue = length(relC);
+  if(dTrue > uCompD0){
+    float dComp = uCompD0 + uCompK*(dTrue-uCompD0)/(uCompK+(dTrue-uCompD0));
+    wpOut.xyz = cameraPosition + relC*(dComp/dTrue);
+  }
 }
 vec4 mvPosition = viewMatrix * wpCurve;
-gl_Position = projectionMatrix * mvPosition;`);
+gl_Position = projectionMatrix * (viewMatrix * wpOut);`);
   };
 }
 [groundMat, roadMat, barkMat, canopyMat, smallMat, conMat, wallMat, roofMat,
  carMat, siloMat, fenceMat, baleMat, cowMat, aoMat,
  signPostMat, signBackMat, ...faceMats, apronMat, hullMat, spDarkMat, spGlowMat].forEach(addCurvature);
+// the celestial bodies skip the local-terrain curvature but still need to fold
+// inside a clamped far plane: compression only
+addCurvature(planet.material, false);
+addCurvature(moonMat, false);
 
 const clock = new THREE.Clock();
 const fwd = new THREE.Vector3(), rgt = new THREE.Vector3(), tgt = new THREE.Vector3();
 const tmpQ = new THREE.Quaternion(), headPos = new THREE.Vector3();
+
+// CPU twin of the shader depth compression, for sprites we position manually
+function compressRatio(d){
+  if(uCompOn.value < 0.5 || d <= uCompD0.value || d <= 0) return 1;
+  const dc = uCompD0.value + uCompK.value*(d - uCompD0.value)/(uCompK.value + (d - uCompD0.value));
+  return dc/d;
+}
+
+/* game controllers (PS/Xbox): visionOS exposes paired pads to WebXR sessions as
+   input sources with a gamepad (behind the WebXR Gamepads flag); elsewhere they
+   arrive via the plain Gamepad API. Left stick moves, right stick rises/turns. */
+const pad = { f:0, s:0, u:0, sprint:false, turn:0 };
+let snapLatch = 0;
+function dzn(v){ return Math.abs(v) > 0.15 ? v : 0; }
+function readPads(){
+  pad.f = 0; pad.s = 0; pad.u = 0; pad.sprint = false; pad.turn = 0;
+  const found = [];
+  const session = renderer.xr.getSession && renderer.xr.getSession();
+  if(session && session.inputSources){
+    for(const src of session.inputSources){
+      if(src.gamepad && src.gamepad.axes && src.gamepad.axes.length >= 2) found.push(src.gamepad);
+    }
+  }
+  if(!found.length && navigator.getGamepads){
+    for(const g of navigator.getGamepads()){
+      if(g && g.connected && g.axes && g.axes.length >= 2) found.push(g);
+    }
+  }
+  for(const g of found){
+    const o = g.mapping === 'xr-standard' ? 2 : 0;   // xr-standard puts the stick on axes 2/3
+    pad.s += dzn(g.axes[o] || 0);
+    pad.f += -dzn(g.axes[o+1] || 0);
+    if(g.mapping !== 'xr-standard' && g.axes.length >= 4){
+      pad.u += -dzn(g.axes[3] || 0);      // right stick up/down: rise and descend
+      pad.turn = dzn(g.axes[2] || 0);     // right stick left/right: snap turn (VR only)
+    }
+    const b = g.buttons || [];
+    if((b[7] && b[7].pressed) || (b[5] && b[5].pressed)) pad.sprint = true;   // R2 or R1
+    if(b[12] && b[12].pressed) baseSpeed = clamp(baseSpeed * 1.015, 6, 15000); // d-pad up
+    if(b[13] && b[13].pressed) baseSpeed = clamp(baseSpeed * 0.985, 6, 15000); // d-pad down
+  }
+}
 
 function animate(){
   const dt = Math.min(clock.getDelta(), 0.05);
@@ -2067,11 +2168,18 @@ function animate(){
   if(keys['KeyA'] || keys['ArrowLeft'])  s -= 1;
   if(keys['Space'] || keys['KeyE']) u += 1;
   if(keys['KeyC'] || keys['KeyQ'])  u -= 1;
-  f += -moveVec.y + pinchFly; s += moveVec.x; u += flyUp - flyDown;
+  readPads();
+  f += -moveVec.y + pinchFly + pad.f; s += moveVec.x + pad.s; u += flyUp - flyDown + pad.u;
+  if(presenting){   // right-stick snap turn: 30 degrees per flick, no smooth spin
+    if(snapLatch === 0 && Math.abs(pad.turn) > 0.6){
+      rig.rotation.y -= Math.sign(pad.turn) * Math.PI/6;
+      snapLatch = 1;
+    } else if(Math.abs(pad.turn) < 0.3) snapLatch = 0;
+  }
 
   if(keys['KeyT']) baseSpeed = clamp(baseSpeed * Math.exp(dt*1.7), 6, 15000);
   if(keys['KeyR']) baseSpeed = clamp(baseSpeed * Math.exp(-dt*1.7), 6, 15000);
-  const sprint = keys['ShiftLeft'] || keys['ShiftRight'] ? 3.4 : 1;
+  const sprint = keys['ShiftLeft'] || keys['ShiftRight'] || pad.sprint ? 3.4 : 1;
   const sp = baseSpeed * sprint;
   camera.getWorldDirection(fwd);
   if(presenting){   // strafe relative to where the head points
@@ -2099,13 +2207,39 @@ function animate(){
   }
   camera.getWorldPosition(headPos);   // eye position: rig origin on desktop, tracked head in XR
 
+  // read the far plane the headset actually granted; fold the world inside it
+  if(presenting){
+    const xc = renderer.xr.getCamera();
+    if(xc.cameras && xc.cameras.length){
+      const pe = xc.cameras[0].projectionMatrix.elements;
+      const den = pe[10] + 1.0;
+      const xrFar = Math.abs(den) > 1e-7 ? Math.abs(pe[14] / den) : Infinity;
+      window.__xrFar = xrFar;
+      if(isFinite(xrFar) && xrFar < 250000){
+        uCompOn.value = 1;
+        uCompD0.value = clamp(xrFar * 0.3, 60, 400);
+        uCompK.value = Math.max(xrFar * 0.85 - uCompD0.value, 50);
+      } else uCompOn.value = 0;
+    }
+  } else uCompOn.value = 0;
+
   // living details: canopy sway clock, speed-reactive field of view
   uTime.value = t;
   spGlowMat.emissiveIntensity = 2.0 + Math.sin(t*2.4)*0.7;   // the port breathes, ready to launch
   glowMat.opacity = 0.34 + 0.12*Math.sin(t*2.4);             // halo sprites breathe with it
-  for(const gw of glows){   // halos follow the planetary curvature their anchors render with
+  for(const gw of glows){   // halos follow the curvature and compression their anchors render with
     const gdx = gw.x - headPos.x, gdz = gw.z - headPos.z;
-    gw.spr.position.y = gw.y - (gdx*gdx + gdz*gdz)/440000;
+    const gy = gw.y - (gdx*gdx + gdz*gdz)/440000;
+    const gdy = gy - headPos.y;
+    const gr2 = compressRatio(Math.sqrt(gdx*gdx + gdy*gdy + gdz*gdz));
+    gw.spr.position.set(headPos.x + gdx*gr2, headPos.y + gdy*gr2, headPos.z + gdz*gr2);
+    gw.spr.scale.set(gw.s*gr2, gw.s*gr2, 1);
+  }
+  { // the moon's halo sprite tracks the compressed moon
+    const mdx = MOON_POS.x - headPos.x, mdy = MOON_POS.y - headPos.y, mdz = MOON_POS.z - headPos.z;
+    const mr = compressRatio(Math.sqrt(mdx*mdx + mdy*mdy + mdz*mdz));
+    moonGlow.position.set(headPos.x + mdx*mr, headPos.y + mdy*mr, headPos.z + mdz*mr);
+    moonGlow.scale.set(129000*mr, 129000*mr, 1);
   }
   if(!presenting){   // the headset owns the projection; FOV kick is desktop-only
     camera.fov += ((62 + 9*clamp(vel.length()/500, 0, 1)) - camera.fov) * 0.06;
