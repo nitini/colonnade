@@ -58,7 +58,7 @@
       <b>W A S D</b> move &nbsp; <b>mouse</b> look &nbsp; (in VR: turn your head)<br>
       <b>Space</b> rise &nbsp; <b>C</b> descend &nbsp; <b>Shift</b> sprint &nbsp; <b>pinch-hold</b> glide<br>
       <b>T/R</b> or <b>scroll</b> speed &nbsp; <b>M</b> wind &nbsp; <b>0</b> reset &nbsp; <b>Esc</b> pause<br>
-      <b>gamepad</b> left stick move &nbsp; right stick turn + rise &nbsp; <b>R2/L2</b> throttle &nbsp; <b>R1</b> boost &nbsp; <b>&#9651;</b> reset<br>
+      <b>gamepad</b> left stick move &nbsp; right stick look &nbsp; <b>&#10005;/&#9675;</b> rise/descend &nbsp; <b>R2/L2</b> throttle &nbsp; <b>R1</b> boost &nbsp; <b>&#9651;</b> reset<br>
       <span style="color:#8fb8d8">press a controller button on this screen first, and approve Safari's one-time prompt</span>
     </p>
   </div>
@@ -136,6 +136,7 @@ const START_YAW = -0.18, START_PITCH = -0.04;
 /* the player rig: all locomotion moves this group. On desktop the camera sits at
    its origin; in XR the headset drives the camera's pose inside it. */
 const rig = new THREE.Group();
+rig.rotation.order = 'YXZ';   // yaw about world up, then stick-pitch about the local right axis
 rig.add(camera);
 rig.position.copy(START_POS);
 scene.add(rig);
@@ -713,7 +714,7 @@ const atmoMat = new THREE.ShaderMaterial({
         vec3 rel = wp.xyz - cameraPosition;
         float dTrue = length(rel);
         if(dTrue > uCompD0){
-          float dComp = uCompD0 + uCompK*(dTrue-uCompD0)/(uCompK+(dTrue-uCompD0));
+          float dComp = uCompD0 + uCompK*tanh(min((dTrue-uCompD0)/uCompK, 20.0));
           wp.xyz = cameraPosition + rel*(dComp/dTrue);
         }
       }
@@ -1013,7 +1014,7 @@ canopyMat.onBeforeCompile = (sh)=>{
 // --- instance the colonnade, in chunks of 10 so off-screen giants are culled ---
 const aoGeo = new THREE.CircleGeometry(380, 24); aoGeo.rotateX(-Math.PI/2);
 const aoMat = new THREE.MeshBasicMaterial({ map: aoTexture(), transparent:true, depthWrite:false,
-  polygonOffset:true, polygonOffsetFactor:-1, polygonOffsetUnits:-2 });
+  opacity:0.55, polygonOffset:true, polygonOffsetFactor:-1, polygonOffsetUnits:-2 });
 {
   const m = new THREE.Matrix4(), q = new THREE.Quaternion(), e = new THREE.Euler(), sv = new THREE.Vector3();
   const PER = 10;
@@ -1134,6 +1135,7 @@ clumped(6500, -900, -150, -4500, 2800, 260);    // dense near belt
 clumped(2200, -900, -150, -8000, -4500, 130);   // continuing down the corridor
 for(let i=0;i<6000;i++) conSpots.push([rr(-480,-150), rr(-8000, 2800)]);   // uniform fill closes clump gaps
 for(let i=0;i<1800;i++) conSpots.push([rr(-900,-480), rr(-8000, 2800)]);
+for(let i=0;i<7000;i++) conSpots.push([rr(-2600,-900), rr(-8000, 2800)]);   // depth beyond the belt: from altitude, bare painted carpet reads as a void
 // east side: understory forward of the trunks where the road can see it
 for(let i=0;i<6500;i++){
   const x = i%9 < 7 ? rr(300, 820) : rr(820, 1100);
@@ -1458,7 +1460,7 @@ const puffs = [];
   }
 }
 const puffTex = puffTexture();
-function billboardMat(tintHex, opac){
+function billboardMat(tintHex, opac, nf0, nf1){
   return new THREE.ShaderMaterial({
     transparent: true, depthWrite: false, side: THREE.DoubleSide,
     uniforms: {
@@ -1467,11 +1469,13 @@ function billboardMat(tintHex, opac){
       opac: { value: opac },
       fogColor: { value: FOG_COLOR.clone() },
       fogNear: { value: 13000 }, fogFar: { value: 28000 },
+      nf0: { value: nf0 }, nf1: { value: nf1 },
       uCompOn, uCompD0, uCompK
     },
     vertexShader:`
-    varying vec2 vUv; varying float vFog;
+    varying vec2 vUv; varying float vFog; varying float vNear;
     uniform float fogNear; uniform float fogFar;
+    uniform float nf0; uniform float nf1;
     uniform float uCompOn; uniform float uCompD0; uniform float uCompK;
     void main(){
       vUv = uv;
@@ -1485,9 +1489,10 @@ function billboardMat(tintHex, opac){
       vec3 rel = wc.xyz - cameraPosition;
       float dTrue = length(rel);
       vFog = smoothstep(fogNear, fogFar, dTrue);
+      vNear = smoothstep(nf0, nf1, dTrue);   // fade out before the quad reads as a wall
       float ratio = 1.0;
       if(uCompOn > 0.5 && dTrue > uCompD0){
-        float dComp = uCompD0 + uCompK*(dTrue-uCompD0)/(uCompK+(dTrue-uCompD0));
+        float dComp = uCompD0 + uCompK*tanh(min((dTrue-uCompD0)/uCompK, 20.0));
         ratio = dComp/dTrue;
         wc.xyz = cameraPosition + rel*ratio;
       }
@@ -1497,18 +1502,18 @@ function billboardMat(tintHex, opac){
     }`,
     fragmentShader:`
     uniform sampler2D map; uniform vec3 fogColor; uniform vec3 tint; uniform float opac;
-    varying vec2 vUv; varying float vFog;
+    varying vec2 vUv; varying float vFog; varying float vNear;
     void main(){
       vec4 t = texture2D(map, vUv);
       if(t.a < 0.02) discard;
       vec3 col = mix(t.rgb * tint, fogColor, vFog);
-      gl_FragColor = vec4(col, t.a * opac);
+      gl_FragColor = vec4(col, t.a * opac * vNear);
       #include <tonemapping_fragment>
       #include <colorspace_fragment>
     }`
   });
 }
-const cloudMat = billboardMat('#f0dcba', 0.95);
+const cloudMat = billboardMat('#f0dcba', 0.95, 150, 450);
 const cloudInst = new THREE.InstancedMesh(new THREE.PlaneGeometry(1,1), cloudMat, puffs.length);
 {
   const m = new THREE.Matrix4(), q = new THREE.Quaternion();
@@ -1534,7 +1539,7 @@ for(let i=0;i<110;i++){
   const sx = rr(480, 1100);
   mists.push({ x: mx, y: my, z: rr(-8000, 2800), sx, sy: sx*rr(0.14,0.24) });
 }
-const mistMat = billboardMat('#c5c6c2', 0.34);
+const mistMat = billboardMat('#c5c6c2', 0.34, 250, 1000);
 const mistInst = new THREE.InstancedMesh(new THREE.PlaneGeometry(1,1), mistMat, mists.length);
 {
   const m = new THREE.Matrix4(), q = new THREE.Quaternion();
@@ -1569,7 +1574,7 @@ const shaftMat = new THREE.ShaderMaterial({
       float dTrue = length(rel);
       vDist = dTrue;
       if(uCompOn > 0.5 && dTrue > uCompD0){
-        float dComp = uCompD0 + uCompK*(dTrue-uCompD0)/(uCompK+(dTrue-uCompD0));
+        float dComp = uCompD0 + uCompK*tanh(min((dTrue-uCompD0)/uCompK, 20.0));
         wpS.xyz = cameraPosition + rel*(dComp/dTrue);
       }
       vec4 mv = viewMatrix * wpS;
@@ -1723,7 +1728,7 @@ document.addEventListener('keydown', (e)=>{
   if(['Space','KeyW','KeyA','KeyS','KeyD','KeyC','KeyQ','KeyE'].includes(e.code)) e.preventDefault();
   if(e.code === 'KeyM' && audio){ audio.muted = !audio.muted; }
   if(e.code === 'Digit0' || e.code === 'Backspace'){
-    rig.position.copy(START_POS); yaw = START_YAW; pitch = START_PITCH; vel.set(0,0,0);
+    rig.position.copy(START_POS); rig.rotation.x = 0; yaw = START_YAW; pitch = START_PITCH; vel.set(0,0,0);
   }
 });
 document.addEventListener('keyup', (e)=>{ keys[e.code] = false; });
@@ -1802,7 +1807,7 @@ vrbtn.addEventListener('click', async (e)=>{
   } catch(err){ window.__show_err('VR: ' + (err && err.message ? err.message : err)); }
 });
 renderer.xr.addEventListener('sessionstart', ()=>{
-  rig.rotation.y = yaw;        // keep facing the way you were on the flat page
+  rig.rotation.set(0, yaw, 0); // keep facing the way you were on the flat page, level
   camera.rotation.set(0,0,0);
   camera.near = 0.6;           // the ground at your feet must not clip when standing
   // ask for a modest far plane: headsets that reject an absurd request outright
@@ -1815,7 +1820,7 @@ renderer.xr.addEventListener('sessionstart', ()=>{
 });
 renderer.xr.addEventListener('sessionend', ()=>{
   pinchFly = 0;
-  rig.rotation.y = 0;
+  rig.rotation.set(0, 0, 0);
   camera.position.set(0,0,0);  // the headset moved the camera inside the rig; recenter
   camera.rotation.set(pitch, yaw, 0);
   camera.near = 2.5;
@@ -1943,29 +1948,38 @@ function addGlow(x, y, z, s){
   scene.add(spr);
 }
 
-/* ============================ comfort vignette ============================ */
-/* In the headset, fast motion tunnels the view: a camera-locked vignette that
-   fades in with speed. The CSS vignette can't follow us into the session. */
+/* ============================ VR speed HUD ============================ */
+/* A small camera-locked readout of speed and altitude, since the DOM HUD
+   can't follow us into the session. */
 
-function vignetteTexture(){
-  const c = makeCanvas(256,256), g = c.getContext('2d');
-  const gr = g.createRadialGradient(128,128,52, 128,128,128);
-  gr.addColorStop(0,'rgba(4,7,11,0)');
-  gr.addColorStop(0.55,'rgba(4,7,11,0)');
-  gr.addColorStop(1,'rgba(4,7,11,1)');
-  g.fillStyle = gr; g.fillRect(0,0,256,256);
-  return new THREE.CanvasTexture(c);
+const hudCanvas = makeCanvas(256, 64);
+const hudCtx = hudCanvas.getContext('2d');
+const hudTex = new THREE.CanvasTexture(hudCanvas);
+const hudMat = new THREE.MeshBasicMaterial({ map: hudTex, transparent: true,
+  depthTest: false, depthWrite: false, fog: false });
+// sits past the airborne near plane (2.5 m); drawn last with depth off
+const hudMesh = new THREE.Mesh(new THREE.PlaneGeometry(1.0, 0.25), hudMat);
+hudMesh.position.set(-0.85, -0.95, -3);
+hudMesh.renderOrder = 1000;
+hudMesh.frustumCulled = false;
+hudMesh.visible = false;
+camera.add(hudMesh);
+let hudLast = 0, hudText = '';
+function updateHud(t, sp, alt){
+  if(t - hudLast < 0.15) return;
+  hudLast = t;
+  const txt = Math.round(sp) + ' m/s   ' + Math.round(alt) + ' m';
+  if(txt === hudText) return;
+  hudText = txt;
+  hudCtx.clearRect(0, 0, 256, 64);
+  hudCtx.fillStyle = 'rgba(8,16,28,0.55)';
+  hudCtx.fillRect(0, 0, 256, 64);
+  hudCtx.fillStyle = '#dfe9f5';
+  hudCtx.font = '600 24px ui-monospace, Menlo, monospace';
+  hudCtx.textAlign = 'center'; hudCtx.textBaseline = 'middle';
+  hudCtx.fillText(txt, 128, 33);
+  hudTex.needsUpdate = true;
 }
-const vigMat3D = new THREE.MeshBasicMaterial({ map: vignetteTexture(), transparent: true,
-  opacity: 0, depthTest: false, depthWrite: false, fog: false });
-// sits past the near plane; drawn last with depth off, so it overlays everything
-const vigMesh = new THREE.Mesh(new THREE.PlaneGeometry(18,18), vigMat3D);
-vigMesh.position.set(0, 0, -4);
-vigMesh.renderOrder = 999;
-vigMesh.frustumCulled = false;
-vigMesh.visible = false;
-camera.add(vigMesh);
-let vigOp = 0;
 
 /* ============================ the spaceport ============================ */
 const SP = { x: 67, z: 6600 };
@@ -2113,7 +2127,7 @@ if(uCompOn > 0.5){
   vec3 relC = wpCurve.xyz - cameraPosition;
   float dTrue = length(relC);
   if(dTrue > uCompD0){
-    float dComp = uCompD0 + uCompK*(dTrue-uCompD0)/(uCompK+(dTrue-uCompD0));
+    float dComp = uCompD0 + uCompK*tanh(min((dTrue-uCompD0)/uCompK, 20.0));
     wpOut.xyz = cameraPosition + relC*(dComp/dTrue);
   }
 }
@@ -2136,18 +2150,18 @@ const tmpQ = new THREE.Quaternion(), headPos = new THREE.Vector3();
 // CPU twin of the shader depth compression, for sprites we position manually
 function compressRatio(d){
   if(uCompOn.value < 0.5 || d <= uCompD0.value || d <= 0) return 1;
-  const dc = uCompD0.value + uCompK.value*(d - uCompD0.value)/(uCompK.value + (d - uCompD0.value));
+  const dc = uCompD0.value + uCompK.value*Math.tanh((d - uCompD0.value)/uCompK.value);
   return dc/d;
 }
 
 /* game controllers (PS/Xbox): visionOS exposes paired pads to WebXR sessions as
    input sources with a gamepad (behind the WebXR Gamepads flag); elsewhere they
    arrive via the plain Gamepad API. Left stick moves, right stick rises/turns. */
-const pad = { f:0, s:0, u:0, sprint:false, turn:0, accel:0, decel:0, reset:false };
+const pad = { f:0, s:0, u:0, sprint:false, turn:0, pitch:0, accel:0, decel:0, reset:false };
 let dbgKeys = 0, dbgPadsMax = 0;
 function dzn(v){ return Math.abs(v) > 0.15 ? v : 0; }
 function readPads(){
-  pad.f = 0; pad.s = 0; pad.u = 0; pad.sprint = false; pad.turn = 0;
+  pad.f = 0; pad.s = 0; pad.u = 0; pad.sprint = false; pad.turn = 0; pad.pitch = 0;
   pad.accel = 0; pad.decel = 0; pad.reset = false;
   const found = [];
   const session = renderer.xr.getSession && renderer.xr.getSession();
@@ -2167,10 +2181,12 @@ function readPads(){
     pad.s += dzn(g.axes[o] || 0);
     pad.f += -dzn(g.axes[o+1] || 0);
     if(g.mapping !== 'xr-standard' && g.axes.length >= 4){
-      pad.u += -dzn(g.axes[3] || 0);       // right stick up/down: rise and descend
+      pad.pitch += dzn(g.axes[3] || 0);    // right stick up/down: pitch (VR)
       pad.turn += dzn(g.axes[2] || 0);     // right stick left/right: smooth turn (VR)
     }
     const b = g.buttons || [];
+    if(b[0] && b[0].pressed) pad.u += 1;                                         // cross: rise
+    if(b[1] && b[1].pressed) pad.u -= 1;                                         // circle: descend
     if(b[5] && b[5].pressed) pad.sprint = true;                                  // R1: boost
     pad.accel = Math.max(pad.accel, b[7] ? (b[7].value || (b[7].pressed?1:0)) : 0); // R2: throttle up
     pad.decel = Math.max(pad.decel, b[6] ? (b[6].value || (b[6].pressed?1:0)) : 0); // L2: throttle down
@@ -2227,8 +2243,13 @@ function animate(){
   if(keys['KeyC'] || keys['KeyQ'])  u -= 1;
   readPads();
   f += -moveVec.y + pinchFly + pad.f; s += moveVec.x + pad.s; u += flyUp - flyDown + pad.u;
-  if(presenting && pad.turn) rig.rotation.y -= pad.turn * dt * 2.4;   // right stick: smooth console-style yaw
-  if(pad.reset){ rig.position.copy(START_POS); vel.set(0,0,0); }
+  if(presenting){   // right stick: smooth console-style look — yaw plus pitch
+    if(pad.turn) rig.rotation.y -= pad.turn * dt * 2.4;
+    if(pad.pitch) rig.rotation.x = clamp(rig.rotation.x - pad.pitch * dt * 1.8, -1.35, 1.35);
+    // ease the world level again near the ground so you never land tilted
+    else if(rig.position.y < 30 && Math.abs(rig.rotation.x) > 0.001) rig.rotation.x *= Math.exp(-dt*1.2);
+  }
+  if(pad.reset){ rig.position.copy(START_POS); rig.rotation.x = 0; vel.set(0,0,0); }
 
   // throttle: hold to accelerate/brake exponentially (R2/L2 are analog)
   const thr = (keys['KeyT'] ? 1 : 0) + pad.accel;
@@ -2253,6 +2274,9 @@ function animate(){
   rig.position.y = clamp(rig.position.y, presenting ? 0.05 : 2.2, 420000);
   rig.position.x = clamp(rig.position.x, -450000, 450000);
   rig.position.z = clamp(rig.position.z, -450000, 450000);
+  if(presenting && rig.position.y + camera.position.y < 1.05){
+    rig.position.y = 1.05 - camera.position.y;   // never let the tracked eyes dip under the grass
+  }
   { // the moon has a surface: skim it, don't pass through it
     const dm = rig.position.distanceTo(MOON_POS);
     if(dm < 47300){
@@ -2286,13 +2310,11 @@ function animate(){
     camera.updateProjectionMatrix();
   }
 
-  // comfort vignette: tunnel the view while moving fast in the headset
+  // speed + altitude readout, pinned low-left in the view
   if(presenting){
-    const vigTarget = clamp((vel.length() - 60) / 600, 0, 0.7);
-    vigOp += (vigTarget - vigOp) * (vigTarget > vigOp ? 0.16 : 0.06);
-    vigMat3D.opacity = vigOp;
-    vigMesh.visible = vigOp > 0.02;
-  } else vigMesh.visible = false;
+    hudMesh.visible = true;
+    updateHud(t, vel.length(), rig.position.y);
+  } else hudMesh.visible = false;
 
   // ascent into space: sky darkens, stars flood in, haze color follows
   uSpaceU.value = clamp((headPos.y - 9000) / 55000, 0, 1);
