@@ -118,6 +118,7 @@ renderer.shadowMap.enabled = true;
 renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 renderer.xr.enabled = true;
 renderer.xr.setFoveation(1);   // strongest fixed foveation: big fill-rate win in the headset
+renderer.xr.cameraAutoUpdate = false;   // we call updateCamera ourselves so the culling-far patch survives into render
 document.body.appendChild(renderer.domElement);
 window.__booted = true;
 const maxAniso = renderer.capabilities.getMaxAnisotropy();
@@ -808,7 +809,9 @@ groundMat.onBeforeCompile = function(sh){
     '#include <map_fragment>\n  float dgr = texture2D(dtex, vMapUv*900.0).r;\n  float dg2 = texture2D(dtex, vMapUv*57.0).r;\n  diffuseColor.rgb *= (0.80 + 0.34*dgr) * (0.86 + 0.26*dg2);\n  float gl1 = dot(texture2D(gtex, vMapUv*1600.0).rgb, vec3(0.3333));\n  float gl2 = dot(texture2D(gtex, vMapUv*240.0).rgb, vec3(0.3333));\n  diffuseColor.rgb *= mix(1.0, (0.50 + 1.05*gl1) * (0.72 + 0.56*gl2), uGrassOn);\n  diffuseColor.a *= 1.0 - smoothstep(21000.0, 28500.0, length(vMapUv - 0.5) * 60000.0);'
   );
 };
-const ground = new THREE.Mesh(new THREE.PlaneGeometry(60000, 60000, 128, 128), groundMat);
+/* 256 segments: under depth compression, coarse triangles cut chords across the
+   radial remap and bulge over the roads and houses sitting on them */
+const ground = new THREE.Mesh(new THREE.PlaneGeometry(60000, 60000, 256, 256), groundMat);
 { // pull the square's corners onto a circle: the alpha fade completes inside the rim,
   // and the AO/depth prepasses see the same disc, so no silhouette from any angle
   const gp = ground.geometry.attributes.position;
@@ -844,6 +847,8 @@ scene.add(ground);
 
 const roadTex = roadTexture();
 const roadMat = new THREE.MeshStandardMaterial({ map: roadTex, roughness: 0.92, metalness: 0, envMapIntensity: 0.55 });
+// pull the road decisively in front of the ground in depth: compressed-range precision is scarce
+roadMat.polygonOffset = true; roadMat.polygonOffsetFactor = -1; roadMat.polygonOffsetUnits = -2;
 for(const rx of [-70, 205]){
   const road = new THREE.Mesh(new THREE.PlaneGeometry(30, 34000, 1, 160), roadMat);
   road.rotation.x = -Math.PI/2;
@@ -1006,7 +1011,8 @@ canopyMat.onBeforeCompile = (sh)=>{
 
 // --- instance the colonnade, in chunks of 10 so off-screen giants are culled ---
 const aoGeo = new THREE.CircleGeometry(380, 24); aoGeo.rotateX(-Math.PI/2);
-const aoMat = new THREE.MeshBasicMaterial({ map: aoTexture(), transparent:true, depthWrite:false });
+const aoMat = new THREE.MeshBasicMaterial({ map: aoTexture(), transparent:true, depthWrite:false,
+  polygonOffset:true, polygonOffsetFactor:-1, polygonOffsetUnits:-2 });
 {
   const m = new THREE.Matrix4(), q = new THREE.Quaternion(), e = new THREE.Euler(), sv = new THREE.Vector3();
   const PER = 10;
@@ -1712,6 +1718,7 @@ document.addEventListener('mousemove', (e)=>{
 });
 document.addEventListener('keydown', (e)=>{
   keys[e.code] = true;
+  if(renderer.xr.isPresenting) dbgKeys++;
   if(['Space','KeyW','KeyA','KeyS','KeyD','KeyC','KeyQ','KeyE'].includes(e.code)) e.preventDefault();
   if(e.code === 'KeyM' && audio){ audio.muted = !audio.muted; }
   if(e.code === 'Digit0' || e.code === 'Backspace'){
@@ -1797,7 +1804,11 @@ renderer.xr.addEventListener('sessionstart', ()=>{
   rig.rotation.y = yaw;        // keep facing the way you were on the flat page
   camera.rotation.set(0,0,0);
   camera.near = 0.6;           // the ground at your feet must not clip when standing
+  // ask for a modest far plane: headsets that reject an absurd request outright
+  // may grant a reasonable one, and every extra meter relaxes the compression curve
+  camera.far = 30000;
   camera.updateProjectionMatrix();
+  dbgKeys = 0; dbgPadsMax = 0;
   overlay.style.display = 'none';
   cross.style.display = 'none';
 });
@@ -1807,13 +1818,19 @@ renderer.xr.addEventListener('sessionend', ()=>{
   camera.position.set(0,0,0);  // the headset moved the camera inside the rig; recenter
   camera.rotation.set(pitch, yaw, 0);
   camera.near = 2.5;
+  camera.far = 600000;
   camera.updateProjectionMatrix();
   overlay.style.display = 'flex';
   goText.textContent = 'Paused. Click to continue';
   if(window.__xrFar){
     xrstat.textContent = 'Headset far plane: ' + Math.round(window.__xrFar) + ' m' +
-      (window.__xrFar < 250000 ? ' — depth compression was active.' : '');
+      (window.__xrFar < 250000 ? ' (compression active)' : '') +
+      ' · seen in VR: ' + dbgKeys + ' key events, ' + dbgPadsMax + ' controller(s)';
   }
+});
+// flat-page probe: press any controller button here and Safari names the pad
+window.addEventListener('gamepadconnected', (e)=>{
+  if(!renderer.xr.isPresenting) xrstat.textContent = 'Controller detected: ' + e.gamepad.id;
 });
 
 /* ============================ wind audio ============================ */
@@ -1976,6 +1993,7 @@ function apronTexture(){
   return t;
 }
 const apronMat = new THREE.MeshStandardMaterial({ map: apronTexture(), roughness: 0.85, metalness: 0.08 });
+apronMat.polygonOffset = true; apronMat.polygonOffsetFactor = -1; apronMat.polygonOffsetUnits = -2;
 const apron = new THREE.Mesh(new THREE.CircleGeometry(2300, 96), apronMat);
 apron.rotation.x = -Math.PI/2;
 apron.position.set(SP.x, 6, SP.z);
@@ -2122,7 +2140,7 @@ function compressRatio(d){
    input sources with a gamepad (behind the WebXR Gamepads flag); elsewhere they
    arrive via the plain Gamepad API. Left stick moves, right stick rises/turns. */
 const pad = { f:0, s:0, u:0, sprint:false, turn:0 };
-let snapLatch = 0;
+let snapLatch = 0, dbgKeys = 0, dbgPadsMax = 0;
 function dzn(v){ return Math.abs(v) > 0.15 ? v : 0; }
 function readPads(){
   pad.f = 0; pad.s = 0; pad.u = 0; pad.sprint = false; pad.turn = 0;
@@ -2138,6 +2156,7 @@ function readPads(){
       if(g && g.connected && g.axes && g.axes.length >= 2) found.push(g);
     }
   }
+  if(renderer.xr.isPresenting && found.length > dbgPadsMax) dbgPadsMax = found.length;
   for(const g of found){
     const o = g.mapping === 'xr-standard' ? 2 : 0;   // xr-standard puts the stick on axes 2/3
     pad.s += dzn(g.axes[o] || 0);
@@ -2158,7 +2177,37 @@ function animate(){
   const t = clock.elapsedTime;
   const presenting = renderer.xr.isPresenting;
 
-  if(!presenting) camera.rotation.set(pitch, yaw, 0);   // in XR the headset owns the camera pose
+  if(presenting){
+    renderer.xr.updateCamera(camera);   // manual (cameraAutoUpdate=false): must happen before we read the pose
+    // scarce depth precision: hug the near plane to the ground only when standing on it
+    const wantNear = rig.position.y > 60 ? 2.5 : 0.6;
+    if(camera.near !== wantNear){ camera.near = wantNear; camera.updateProjectionMatrix(); }
+    const xc = renderer.xr.getCamera();
+    if(xc.cameras && xc.cameras.length){
+      // read the far plane the headset actually granted; fold the world inside it
+      const pe = xc.cameras[0].projectionMatrix.elements;
+      const den = pe[10] + 1.0;
+      const xrFar = Math.abs(den) > 1e-7 ? Math.abs(pe[14] / den) : Infinity;
+      window.__xrFar = xrFar;
+      if(isFinite(xrFar) && xrFar < 250000){
+        uCompOn.value = 1;
+        uCompD0.value = clamp(xrFar * 0.3, 60, 400);
+        uCompK.value = Math.max(xrFar * 0.85 - uCompD0.value, 50);
+        // widen the far plane of the CULLING matrix only: CPU frustum culling sees
+        // true positions, but the shaders compress those inside the granted range,
+        // so culling at the granted far wrongly drops canopies, the moon, the planet
+        const ue = xc.projectionMatrix.elements;
+        const un = ue[14] / (ue[10] - 1.0);
+        const CF = 600000.0;
+        ue[10] = -(CF + un) / (CF - un);
+        ue[14] = -2.0 * CF * un / (CF - un);
+        xc.projectionMatrixInverse.copy(xc.projectionMatrix).invert();
+      } else uCompOn.value = 0;
+    }
+  } else {
+    uCompOn.value = 0;
+    camera.rotation.set(pitch, yaw, 0);   // in XR the headset owns the camera pose
+  }
 
   // movement: W flies along the view direction, strafing stays level
   let f = 0, s = 0, u = 0;
@@ -2206,22 +2255,6 @@ function animate(){
     }
   }
   camera.getWorldPosition(headPos);   // eye position: rig origin on desktop, tracked head in XR
-
-  // read the far plane the headset actually granted; fold the world inside it
-  if(presenting){
-    const xc = renderer.xr.getCamera();
-    if(xc.cameras && xc.cameras.length){
-      const pe = xc.cameras[0].projectionMatrix.elements;
-      const den = pe[10] + 1.0;
-      const xrFar = Math.abs(den) > 1e-7 ? Math.abs(pe[14] / den) : Infinity;
-      window.__xrFar = xrFar;
-      if(isFinite(xrFar) && xrFar < 250000){
-        uCompOn.value = 1;
-        uCompD0.value = clamp(xrFar * 0.3, 60, 400);
-        uCompK.value = Math.max(xrFar * 0.85 - uCompD0.value, 50);
-      } else uCompOn.value = 0;
-    }
-  } else uCompOn.value = 0;
 
   // living details: canopy sway clock, speed-reactive field of view
   uTime.value = t;
